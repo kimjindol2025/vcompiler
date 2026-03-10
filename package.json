@@ -1,0 +1,23 @@
+{
+  "name": "vcompiler",
+  "version": "1.0.0",
+  "description": "V language compiler (tree-walking interpreter) written in TypeScript",
+  "type": "module",
+  "main": "dist/main.js",
+  "bin": {
+    "vcompiler": "dist/main.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/main.ts",
+    "run": "tsx src/main.ts",
+    "test": "tsx src/main.ts examples/hello.v && tsx src/main.ts examples/fibonacci.v && tsx src/main.ts examples/structs.v"
+  },
+  "keywords": ["v-lang", "compiler", "interpreter"],
+  "author": "kim",
+  "license": "MIT",
+  "devDependencies": {
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
