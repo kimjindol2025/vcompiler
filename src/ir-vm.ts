@@ -524,17 +524,27 @@ export class IRExecutor {
 
     const frame = new IRFrame(scope)
 
+    const syncClosure = () => {
+      // 클로저 캡처 변수 뮤터블 업데이트: 함수 실행 후 변경된 값을 closure Map에 반영
+      for (const k of closure.keys()) {
+        const updated = scope.get(k)
+        if (updated !== undefined) closure.set(k, updated)
+      }
+    }
+
     try {
       this._execInsts(fn.body, frame)
     } catch (e) {
       if (e instanceof ReturnSignal) {
         this._runDefers(frame)
+        syncClosure()
         return e.val
       }
       throw e
     }
 
     this._runDefers(frame)
+    syncClosure()
     return { v: 'void' }
   }
 
