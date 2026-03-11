@@ -173,6 +173,7 @@ export const PRECEDENCE: Partial<Record<TK, number>> = {
   [TK.CARET]:   4,  // ^
   [TK.AMP]:     5,  // &
   [TK.EQ]:      6,  [TK.NE]:  6,  // == !=
+  [TK.KW_IN]:   6,  [TK.KW_IS]: 6,  // in, is
   [TK.LT]:      7,  [TK.GT]:  7,  [TK.LE]: 7,  [TK.GE]: 7,
   [TK.SHL]:     8,  [TK.SHR]: 8,
   [TK.PLUS]:    9,  [TK.MINUS]: 9,
