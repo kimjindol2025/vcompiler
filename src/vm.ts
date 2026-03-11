@@ -18,6 +18,9 @@ export type VVal =
   | { v: 'fn';     decl: A.FnDecl | A.AnonFn; closure: Scope }
   | { v: 'bound_method'; recv: Extract<VVal, { v: 'struct' }>; decl: A.FnDecl; closure: Scope }
   | { v: 'builtin'; name: string }
+  | { v: 'str_method'; s: string; name: string }
+  | { v: 'arr_method'; elems: VVal[]; name: string }
+  | { v: 'range';  lo: number; hi: number; inclusive: boolean }
   | { v: 'none' }
   | { v: 'option'; inner: VVal }
   | { v: 'void' }
@@ -47,6 +50,9 @@ function toString(val: VVal): string {
     case 'fn':           return `fn(${(val.decl as A.FnDecl).name ?? 'anon'})`
     case 'bound_method': return `method(${val.decl.name})`
     case 'builtin':      return `builtin(${val.name})`
+    case 'str_method':   return `str_method(${val.name})`
+    case 'arr_method':   return `arr_method(${val.name})`
+    case 'range':        return `${val.lo}..${val.inclusive ? '=' : ''}${val.hi === -1 ? '' : val.hi}`
   }
 }
 
@@ -375,7 +381,13 @@ export class VM {
       val.entries.forEach((v, k) => result.push({ v: 'string', s: k }))
       return result
     }
-    // 범위 RangeExpr은 evalExpr에서 배열로 변환됨
+    // range 객체 → 정수 배열
+    if (val.v === 'range') {
+      const hi = val.inclusive ? val.hi + 1 : val.hi
+      const elems: VVal[] = []
+      for (let i = val.lo; i < hi; i++) elems.push({ v: 'int', n: BigInt(i) })
+      return elems
+    }
     throw new VError(`반복 불가능한 값: ${toString(val)}`)
   }
 
@@ -445,7 +457,9 @@ export class VM {
       // ── 식별자 ─────────────────────────────────────
       case 'ident': {
         const val = scope.get(expr.name)
-        if (val === undefined) throw new VError(`'${expr.name}' 는 선언되지 않았습니다`, expr.pos)
+        if (val === undefined) {
+          throw new VError(`'${expr.name}' 는 선언되지 않았습니다`, expr.pos)
+        }
         return val
       }
 
@@ -503,6 +517,35 @@ export class VM {
       // ── 함수 호출 ──────────────────────────────────
       case 'call': {
         const callee = this.evalExpr(expr.callee, scope)
+
+        // _arr_map / _arr_filter: 'it' 변수를 각 원소에 bind하여 lazy 평가
+        if (callee.v === 'builtin' &&
+            (callee.name === '_arr_map' || callee.name === '_arr_filter_filter')) {
+          // 배열 수신자를 callee 표현식에서 추출
+          const arrExpr = (expr.callee.t === 'selector')
+            ? (expr.callee as A.SelectorExpr).obj
+            : null
+          const arr = arrExpr ? this.evalExpr(arrExpr, scope) : { v: 'none' as const }
+          if (arr.v !== 'array') throw new VError('map/filter 대상이 배열이 아닙니다')
+          const lambdaExpr = expr.args[0]  // 'it'를 사용하는 표현식 (AST)
+          if (!lambdaExpr) return arr
+          if (callee.name === '_arr_map') {
+            const elems = arr.elems.map(elem => {
+              const inner = new Scope(scope)
+              inner.declare('it', elem, false)
+              return this.evalExpr(lambdaExpr, inner)
+            })
+            return { v: 'array', elems }
+          } else {
+            const elems = arr.elems.filter(elem => {
+              const inner = new Scope(scope)
+              inner.declare('it', elem, false)
+              return isTruthy(this.evalExpr(lambdaExpr, inner))
+            })
+            return { v: 'array', elems }
+          }
+        }
+
         const args   = expr.args.map(a => this.evalExpr(a, scope))
 
         if (callee.v === 'builtin')      return this.callBuiltin(callee.name, args, expr)
@@ -510,6 +553,12 @@ export class VM {
         if (callee.v === 'bound_method') {
           // 리시버를 첫 번째 인자로 넣어서 callFn 호출
           return this.callMethod(callee.decl, callee.recv, args, callee.closure)
+        }
+        if (callee.v === 'str_method') {
+          return this.callStrMethod(callee.s, callee.name, args, expr)
+        }
+        if (callee.v === 'arr_method') {
+          return this.callArrMethod(callee.elems, callee.name, args, expr)
         }
 
         throw new VError(`호출 대상이 함수가 아닙니다: ${toString(callee)}`, expr.pos)
@@ -521,6 +570,11 @@ export class VM {
         const idx = this.evalExpr(expr.index, scope)
 
         if (obj.v === 'array') {
+          // range 슬라이싱: arr[lo..hi] 또는 arr[lo..] (open-end)
+          if (idx.v === 'range') {
+            const rawHi = idx.hi === -1 ? obj.elems.length : (idx.inclusive ? idx.hi + 1 : idx.hi)
+            return { v: 'array', elems: obj.elems.slice(idx.lo, rawHi) }
+          }
           const i = Number(this.toInt(idx))
           if (i < 0 || i >= obj.elems.length)
             throw new VError(`인덱스 ${i} 범위 초과 (크기: ${obj.elems.length})`, expr.pos)
@@ -531,6 +585,11 @@ export class VM {
           return obj.entries.get(key) ?? { v: 'none' }
         }
         if (obj.v === 'string') {
+          // range 슬라이싱: str[lo..hi] 또는 str[lo..] (open-end)
+          if (idx.v === 'range') {
+            const rawHi = idx.hi === -1 ? undefined : (idx.inclusive ? idx.hi + 1 : idx.hi)
+            return { v: 'string', s: obj.s.slice(idx.lo, rawHi) }
+          }
           const i = Number(this.toInt(idx))
           if (i < 0 || i >= obj.s.length)
             throw new VError(`인덱스 ${i} 범위 초과`)
@@ -553,6 +612,12 @@ export class VM {
             // 바운드 메서드: 리시버를 클로저로 캡처
             return { v: 'bound_method', recv: obj, decl: methodDecl, closure: this.global } as any
           }
+          // V의 zero value: 선언된 필드지만 초기화 안 된 경우 타입별 기본값 반환
+          const structDecl = this.structs.get(obj.name)
+          if (structDecl) {
+            const fieldDecl = structDecl.fields.find(f => f.name === expr.field)
+            if (fieldDecl) return this.zeroValue(fieldDecl.type)
+          }
           throw new VError(`필드 '${expr.field}' 없음`, expr.pos)
         }
         if (obj.v === 'array') {
@@ -560,13 +625,27 @@ export class VM {
           return this.arrayMethod(obj, expr.field, expr.pos)
         }
         if (obj.v === 'map') {
+          // map.len — V에서 map.len은 항목 수
+          if (expr.field === 'len') return { v: 'int', n: BigInt(obj.entries.size) }
           // enum 또는 namespace 접근: Color.red
           const val = obj.entries.get(expr.field)
           if (val !== undefined) return val
           throw new VError(`'${expr.field}' 키 없음`, expr.pos)
         }
         if (obj.v === 'string') {
+          // 프로퍼티 (괄호 없이 사용): len
           if (expr.field === 'len') return { v: 'int', n: BigInt(obj.s.length) }
+          // 모든 메서드 호출 → str_method 반환 (callStrMethod에서 처리)
+          return { v: 'str_method', s: obj.s, name: expr.field }
+        }
+        if (obj.v === 'char') {
+          // char 프로퍼티
+          if (expr.field === 'len') return { v: 'int', n: 1n }
+          // char 메서드 → str_method
+          return { v: 'str_method', s: obj.c, name: expr.field }
+        }
+        if (obj.v === 'int') {
+          if (expr.field === 'str') return { v: 'str_method', s: obj.n.toString(), name: 'str' }
         }
         throw new VError(`'${expr.field}' 필드 접근 불가: ${toString(obj)}`, expr.pos)
       }
@@ -633,8 +712,10 @@ export class VM {
 
           if (taken) {
             const inner = new Scope(scope)
-            this.execBlock(branch.body, inner)
-            return { v: 'void' }
+            // if 표현식: 마지막 expr 값 반환 (값으로 사용될 때)
+            const result = this.execBlockValue(branch.body, inner)
+            // void이면 execBlock 결과 그대로, 아니면 값 반환
+            return result.v !== 'void' ? result : { v: 'void' }
           }
         }
         return { v: 'void' }
@@ -672,11 +753,22 @@ export class VM {
 
       // ── or 표현식 (Option 언박싱) ──────────────────
       case 'or': {
-        const val = this.evalExpr(expr.expr, scope)
+        let val: VVal
+        try {
+          val = this.evalExpr(expr.expr, scope)
+        } catch (e) {
+          // VError (런타임 에러) → or 블록 실행
+          if (e instanceof VError) {
+            const inner = new Scope(scope)
+            inner.declare('err', { v: 'string', s: e.message }, false)
+            return this.execBlockValue(expr.body, inner)
+          }
+          throw e
+        }
         if (val.v === 'none') {
           const inner = new Scope(scope)
-          this.execBlock(expr.body, inner)
-          return { v: 'void' }
+          inner.declare('err', { v: 'string', s: '' }, false)
+          return this.execBlockValue(expr.body, inner)
         }
         return val.v === 'option' ? val.inner : val
       }
@@ -690,12 +782,12 @@ export class VM {
       // ── 범위 표현식 (배열로 변환) ──────────────────
       case 'range': {
         const low  = this.evalExpr(expr.low,  scope)
-        const high = this.evalExpr(expr.high, scope)
-        const lo = this.toInt(low)
-        const hi = this.toInt(high) + (expr.inclusive ? 1n : 0n)
-        const elems: VVal[] = []
-        for (let i = lo; i < hi; i++) elems.push({ v: 'int', n: i })
-        return { v: 'array', elems }
+        // __range_end__: 상위 경계 없는 range (str[5..])
+        const isOpenEnd = expr.high.t === 'ident' && (expr.high as A.Ident).name === '__range_end__'
+        const lo = Number(this.toInt(low))
+        const hi = isOpenEnd ? -1 : Number(this.toInt(this.evalExpr(expr.high, scope)))
+        // range 객체로 반환 (str[lo..hi] 슬라이싱에 사용)
+        return { v: 'range', lo, hi, inclusive: expr.inclusive }
       }
 
       // ── 익명 함수 ──────────────────────────────────
@@ -713,6 +805,19 @@ export class VM {
   // ──────────────────────────────────────────────────────
 
   private applyBinOp(op: string, l: VVal, r: VVal): VVal {
+    if (!l || !r) {
+      // undefined/null 방어
+      if (!l) l = { v: 'none' }
+      if (!r) r = { v: 'none' }
+    }
+    // in 연산자: key in map / elem in array
+    if (op === 'in') {
+      if (r.v === 'map')   return { v: 'bool', b: r.entries.has(toString(l)) }
+      if (r.v === 'array') return { v: 'bool', b: r.elems.some(e => this.valEqual(e, l)) }
+      if (r.v === 'string') return { v: 'bool', b: r.s.includes(toString(l)) }
+      return { v: 'bool', b: false }
+    }
+
     // 배열 push: arr << elem
     if (l.v === 'array' && op === '<<') {
       l.elems.push(r)
@@ -722,10 +827,17 @@ export class VM {
     // 문자열 연산
     if (l.v === 'string' && op === '+')
       return { v: 'string', s: l.s + toString(r) }
-    if (l.v === 'string' && op === '==')
-      return { v: 'bool', b: l.s === toString(r) }
-    if (l.v === 'string' && op === '!=')
-      return { v: 'bool', b: l.s !== toString(r) }
+    if (l.v === 'string') {
+      const rs = toString(r)
+      switch (op) {
+        case '==': return { v: 'bool', b: l.s === rs }
+        case '!=': return { v: 'bool', b: l.s !== rs }
+        case '<':  return { v: 'bool', b: l.s <  rs }
+        case '>':  return { v: 'bool', b: l.s >  rs }
+        case '<=': return { v: 'bool', b: l.s <= rs }
+        case '>=': return { v: 'bool', b: l.s >= rs }
+      }
+    }
 
     // int 연산
     if (l.v === 'int' && r.v === 'int') {
@@ -777,6 +889,31 @@ export class VM {
       }
     }
 
+    // none/nil 비교: 포인터 null 체크 (x != nil, x == nil)
+    if (r.v === 'none' || l.v === 'none') {
+      const isNoneL = l.v === 'none', isNoneR = r.v === 'none'
+      if (op === '==') return { v: 'bool', b: isNoneL && isNoneR }
+      if (op === '!=') return { v: 'bool', b: !(isNoneL && isNoneR) }
+    }
+
+    // struct/char 비교
+    if ((l.v === 'struct' || r.v === 'struct') && (op === '==' || op === '!=')) {
+      // 동일 객체 비교
+      const eq = l === r
+      return { v: 'bool', b: op === '==' ? eq : !eq }
+    }
+    if (l.v === 'char') {
+      const rs = r.v === 'char' ? r.c : r.v === 'string' ? r.s : toString(r)
+      switch (op) {
+        case '==': return { v: 'bool', b: l.c === rs }
+        case '!=': return { v: 'bool', b: l.c !== rs }
+        case '<':  return { v: 'bool', b: l.c <  rs }
+        case '>':  return { v: 'bool', b: l.c >  rs }
+        case '<=': return { v: 'bool', b: l.c <= rs }
+        case '>=': return { v: 'bool', b: l.c >= rs }
+      }
+    }
+
     throw new VError(`연산 불가: ${toString(l)} ${op} ${toString(r)}`)
   }
 
@@ -804,6 +941,22 @@ export class VM {
   // ──────────────────────────────────────────────────────
   //  메서드 호출 (리시버 바인딩)
   // ──────────────────────────────────────────────────────
+
+  // V의 타입별 zero value 반환
+  private zeroValue(typeName: string): VVal {
+    if (!typeName) return { v: 'none' }
+    const t = typeName.replace(/^mut /, '').replace(/^\&/, '')
+    if (t === 'string')  return { v: 'string', s: '' }
+    if (t === 'bool')    return { v: 'bool', b: false }
+    if (t === 'int' || t === 'i64' || t === 'i32' || t === 'u8' || t === 'byte')
+      return { v: 'int', n: 0n }
+    if (t === 'f32' || t === 'f64') return { v: 'float', f: 0 }
+    if (t.startsWith('[]')) return { v: 'array', elems: [] }
+    if (t.startsWith('map[')) return { v: 'map', entries: new Map() }
+    // 포인터 또는 구조체 참조
+    if (t.startsWith('&')) return { v: 'none' }
+    return { v: 'none' }
+  }
 
   private callMethod(
     decl: A.FnDecl,
@@ -846,8 +999,79 @@ export class VM {
         const bv = b.v === 'int' ? b.n : b.v === 'float' ? BigInt(Math.floor(b.f)) : 0n
         return av < bv ? -1 : av > bv ? 1 : 0
       })}
+      // 인수가 필요한 메서드 → arr_method 반환
+      case 'join':
+      case 'contains':
+      case 'index':
+      case 'any':
+      case 'all':
+        return { v: 'arr_method', elems: arr.elems, name: method }
       default:
         throw new VError(`배열 메서드 없음: '${method}'`, pos)
+    }
+  }
+
+  private callArrMethod(elems: VVal[], method: string, args: VVal[], expr: A.CallExpr): VVal {
+    const a0 = args[0]
+    switch (method) {
+      case 'join': {
+        const sep = a0 ? toString(a0) : ''
+        return { v: 'string', s: elems.map(toString).join(sep) }
+      }
+      case 'contains':
+        return { v: 'bool', b: a0 ? elems.some(e => this.valEqual(e, a0)) : false }
+      case 'index':
+        return { v: 'int', n: BigInt(a0 ? elems.findIndex(e => this.valEqual(e, a0)) : -1) }
+      case 'any': {
+        const lambdaExpr = (expr.args[0] as A.Expr)
+        if (!lambdaExpr) return { v: 'bool', b: false }
+        // 이미 args로 평가됨 — fn 타입이면 call, 아니면 불가
+        return { v: 'bool', b: elems.some(e => isTruthy(a0 && a0.v === 'fn' ? this.callFn(a0.decl, [e], a0.closure) : a0 ?? { v: 'bool', b: false })) }
+      }
+      default:
+        throw new VError(`배열 메서드 없음: '${method}'`, expr.pos)
+    }
+  }
+
+  private callStrMethod(s: string, method: string, args: VVal[], expr: A.CallExpr): VVal {
+    const a0 = args[0] ? toString(args[0]) : ''
+    const a0v = args[0]
+    switch (method) {
+      // 0-인수 메서드
+      case 'to_upper':    return { v: 'string', s: s.toUpperCase() }
+      case 'to_lower':    return { v: 'string', s: s.toLowerCase() }
+      case 'trim':        return { v: 'string', s: s.trim() }
+      case 'trim_space':  return { v: 'string', s: s.trim() }
+      case 'is_empty':    return { v: 'bool',   b: s.length === 0 }
+      case 'len':         return { v: 'int',    n: BigInt(s.length) }
+      case 'int':         return { v: 'int',    n: BigInt(parseInt(s) || 0) }
+      case 'f64': case 'f32': return { v: 'float', f: parseFloat(s) || 0 }
+      case 'str':         return { v: 'string', s }
+      case 'bytes':       return { v: 'array', elems: [...s].map(c => ({ v: 'int' as const, n: BigInt(c.charCodeAt(0)) })) }
+      case 'runes':       return { v: 'array', elems: [...s].map(c => ({ v: 'char' as const, c })) }
+      // char 메서드
+      case 'is_digit':    return { v: 'bool', b: /^\d$/.test(s) }
+      case 'is_alpha':    return { v: 'bool', b: /^[a-zA-Z]$/.test(s) }
+      case 'is_alnum':    return { v: 'bool', b: /^[a-zA-Z0-9_]$/.test(s) }
+      case 'is_space':    return { v: 'bool', b: /^\s$/.test(s) }
+      case 'is_upper':    return { v: 'bool', b: s >= 'A' && s <= 'Z' }
+      case 'is_lower':    return { v: 'bool', b: s >= 'a' && s <= 'z' }
+      // 1-인수 메서드
+      case 'contains':    return { v: 'bool', b: s.includes(a0) }
+      case 'starts_with': return { v: 'bool', b: s.startsWith(a0) }
+      case 'ends_with':   return { v: 'bool', b: s.endsWith(a0) }
+      case 'index_of':    return { v: 'int', n: BigInt(s.indexOf(a0)) }
+      case 'replace':     return { v: 'string', s: s.split(a0).join(toString(args[1] ?? { v: 'string', s: '' })) }
+      case 'split':       return { v: 'array', elems: (a0 ? s.split(a0) : [...s]).map(x => ({ v: 'string' as const, s: x })) }
+      case 'repeat':      return { v: 'string', s: s.repeat(Number(a0v && a0v.v === 'int' ? a0v.n : 0n)) }
+      case 'count':       return { v: 'int', n: BigInt(s.split(a0).length - 1) }
+      case 'substr': {
+        const lo = Number(a0v && a0v.v === 'int' ? a0v.n : 0n)
+        const hi = Number(args[1] && args[1].v === 'int' ? args[1].n : BigInt(s.length))
+        return { v: 'string', s: s.slice(lo, hi) }
+      }
+      default:
+        throw new VError(`문자열 메서드 없음: '${method}'`, expr.pos)
     }
   }
 

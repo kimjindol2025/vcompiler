@@ -160,15 +160,35 @@ export class Parser {
 
   parseExpr(minPrec: number): A.Expr {
     let left = this.parsePrimary()
+    // 리터럴 뒤에도 후위 연산자 처리 ("hello".len, arr[i] 등)
+    left = this.parsePostfix(left)
 
     while (true) {
+      // 범위 연산자 .. (산술보다 낮은 우선순위로 처리)
+      // minPrec=0 일 때만: 최상위 표현식에서만 range 생성
+      if (this.tok.kind === TK.DOTDOT && minPrec === 0) {
+        const pos = this.pos()
+        this.next()
+        const inclusive = this.tok.kind === TK.ASSIGN  // ..=
+        if (inclusive) this.next()
+        // 상위 경계 없는 range: ] 또는 ) 또는 줄끝이면 __range_end__
+        const noHigh = this.tok.kind === TK.RBRACKET || this.tok.kind === TK.RPAREN
+          || this.tok.kind === TK.EOF || this.tok.kind === TK.SEMICOLON
+          || this.tok.kind === TK.LBRACE
+        const high = noHigh
+          ? { t: 'ident', name: '__range_end__', pos } as A.Ident
+          : this.parseExpr(1)  // prec=1 → 내부에서 다시 .. 소비 방지
+        left = { t: 'range', low: left, high, inclusive, pos } as A.RangeExpr
+        break  // range 는 최외곽 — 이후 파싱 없음
+      }
+
       const prec = PRECEDENCE[this.tok.kind] ?? -1
       if (prec <= minPrec) break
 
       const op  = this.tok.lit
       const pos = this.pos()
       this.next()
-      const right = this.parseExpr(prec)  // 우결합: prec (같은 수준도 오른쪽)
+      const right = this.parseExpr(prec)
 
       left = { t: 'infix', left, op, right, pos } as A.InfixExpr
     }
@@ -223,6 +243,18 @@ export class Parser {
     // ── 익명 함수 ─────────────────────────────────────
     if (this.tok.kind === TK.KW_FN) return this.parseAnonFn()
 
+    // ── unsafe { ... } 블록 (표현식으로 사용 시 마지막 값 반환)
+    if (this.tok.kind === TK.KW_UNSAFE) {
+      this.next()
+      const block = this.parseBlock()
+      // unsafe block → OrExpr로 래핑 (마지막 expr 반환)
+      const last = block.stmts.length > 0
+        ? (block.stmts[block.stmts.length - 1] as any).expr
+          ?? { t: 'none', pos }
+        : { t: 'none', pos }
+      return last as A.Expr
+    }
+
     // ── if 표현식 ─────────────────────────────────────
     if (this.tok.kind === TK.KW_IF) return this.parseIfExpr()
 
@@ -254,6 +286,18 @@ export class Parser {
       const name = this.tok.lit
       const ipos = this.pos()
       this.next()
+
+      // map[K]V{} 빈 맵 리터럴 (V 맵 초기화 문법)
+      if (name === 'map' && this.tok.kind === TK.LBRACKET) {
+        this.next()  // [
+        this.parseTypeStr()  // key type (소비)
+        this.expect(TK.RBRACKET)
+        this.parseTypeStr()  // value type (소비)
+        this.expect(TK.LBRACE)
+        // 빈 맵: {} 또는 키:값 쌍 (현재 빈 맵만 지원)
+        this.expect(TK.RBRACE)
+        return { t: 'map', pairs: [], pos: ipos } as A.MapLit
+      }
 
       // int(x), f64(n) 등 타입 캐스트
       const builtinTypes = new Set(['int','i8','i16','i32','i64','u8','u16','u32','u64','f32','f64','string','bool','byte','rune'])
@@ -308,6 +352,13 @@ export class Parser {
         const index = this.parseExpr(0)
         this.expect(TK.RBRACKET)
         expr = { t: 'index', obj: expr, index, pos } as A.IndexExpr
+
+        // or 블록 (인덱싱 후에도 가능: arr[i] or { default })
+        if (this.tok.kind === TK.KW_OR) {
+          this.next()
+          const body = this.parseBlock()
+          expr = { t: 'or', expr, body, pos } as A.OrExpr
+        }
         continue
       }
 
@@ -317,16 +368,6 @@ export class Parser {
         const field = this.expectName()
         expr = { t: 'selector', obj: expr, field, pos } as A.SelectorExpr
         continue
-      }
-
-      // 범위 0..10
-      if (this.tok.kind === TK.DOTDOT) {
-        this.next()
-        const inclusive = this.tok.kind === TK.ASSIGN  // ..=
-        if (inclusive) this.next()
-        const high = this.parseExpr(0)
-        expr = { t: 'range', low: expr, high, inclusive, pos } as A.RangeExpr
-        break
       }
 
       // 후위 ++ / --
@@ -403,8 +444,35 @@ export class Parser {
   private parseArrayInit(): A.ArrayInit {
     const pos = this.pos()
     this.expect(TK.LBRACKET)
-    const elems: A.Expr[] = []
 
+    // []Type{} 또는 []Type{elem, ...} — 타입 애노테이션 처리
+    if (this.tok.kind === TK.RBRACKET) {
+      this.next()  // ]
+      // 타입 이름 소비 (있으면): []string{}, []Token{}, []int{}...
+      if (this.tok.kind === TK.NAME || this.tok.kind === TK.KW_FN) {
+        this.parseTypeStr()  // 타입 소비
+      } else if (this.tok.kind === TK.LBRACKET) {
+        // [][]T — 중첩 배열 타입
+        this.next()  // [
+        this.expect(TK.RBRACKET)  // ]
+        if (this.tok.kind === TK.NAME) this.parseTypeStr()
+      }
+      // {} 초기화
+      if (this.tok.kind === TK.LBRACE) {
+        this.next()  // {
+        const elems: A.Expr[] = []
+        while (this.tok.kind !== TK.RBRACE && this.tok.kind !== TK.EOF) {
+          elems.push(this.parseExpr(0))
+          if (this.tok.kind === TK.COMMA) this.next()
+          else break
+        }
+        this.expect(TK.RBRACE)
+        return { t: 'array', elems, pos }
+      }
+      return { t: 'array', elems: [], pos }
+    }
+
+    const elems: A.Expr[] = []
     while (this.tok.kind !== TK.RBRACKET && this.tok.kind !== TK.EOF) {
       elems.push(this.parseExpr(0))
       if (this.tok.kind === TK.COMMA) this.next()
@@ -631,7 +699,17 @@ export class Parser {
     // mut
     if (this.tok.kind === TK.KW_MUT) { this.next(); result += 'mut ' }
     // 타입명
-    if (this.tok.kind === TK.NAME) { result += this.tok.lit; this.next() }
+    if (this.tok.kind === TK.NAME) {
+      const typeName = this.tok.lit; this.next(); result += typeName
+      // map[K]V 형태 처리
+      if (typeName === 'map' && this.tok.kind === TK.LBRACKET) {
+        this.next()  // [
+        const keyType = this.parseTypeStr()
+        this.expect(TK.RBRACKET)
+        const valType = this.parseTypeStr()
+        result = `map[${keyType}]${valType}`
+      }
+    }
     else if (this.tok.kind === TK.KW_FN) {
       result += 'fn'; this.next()
       // fn(param_types) ret_type 형태 처리
