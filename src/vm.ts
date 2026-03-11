@@ -383,7 +383,7 @@ export class VM {
     }
     // range 객체 → 정수 배열
     if (val.v === 'range') {
-      const hi = val.inclusive ? val.hi + 1 : val.hi
+      const hi = this.rangeEnd(val)
       const elems: VVal[] = []
       for (let i = val.lo; i < hi; i++) elems.push({ v: 'int', n: BigInt(i) })
       return elems
@@ -521,29 +521,21 @@ export class VM {
         // _arr_map / _arr_filter: 'it' 변수를 각 원소에 bind하여 lazy 평가
         if (callee.v === 'builtin' &&
             (callee.name === '_arr_map' || callee.name === '_arr_filter_filter')) {
-          // 배열 수신자를 callee 표현식에서 추출
           const arrExpr = (expr.callee.t === 'selector')
-            ? (expr.callee as A.SelectorExpr).obj
-            : null
+            ? (expr.callee as A.SelectorExpr).obj : null
           const arr = arrExpr ? this.evalExpr(arrExpr, scope) : { v: 'none' as const }
           if (arr.v !== 'array') throw new VError('map/filter 대상이 배열이 아닙니다')
-          const lambdaExpr = expr.args[0]  // 'it'를 사용하는 표현식 (AST)
+          const lambdaExpr = expr.args[0]
           if (!lambdaExpr) return arr
-          if (callee.name === '_arr_map') {
-            const elems = arr.elems.map(elem => {
-              const inner = new Scope(scope)
-              inner.declare('it', elem, false)
-              return this.evalExpr(lambdaExpr, inner)
-            })
-            return { v: 'array', elems }
-          } else {
-            const elems = arr.elems.filter(elem => {
-              const inner = new Scope(scope)
-              inner.declare('it', elem, false)
-              return isTruthy(this.evalExpr(lambdaExpr, inner))
-            })
-            return { v: 'array', elems }
+          const transform = (elem: VVal) => {
+            const inner = new Scope(scope)
+            inner.declare('it', elem, false)
+            return this.evalExpr(lambdaExpr, inner)
           }
+          const elems = callee.name === '_arr_map'
+            ? arr.elems.map(transform)
+            : arr.elems.filter(elem => isTruthy(transform(elem)))
+          return { v: 'array', elems }
         }
 
         const args   = expr.args.map(a => this.evalExpr(a, scope))
@@ -572,8 +564,7 @@ export class VM {
         if (obj.v === 'array') {
           // range 슬라이싱: arr[lo..hi] 또는 arr[lo..] (open-end)
           if (idx.v === 'range') {
-            const rawHi = idx.hi === -1 ? obj.elems.length : (idx.inclusive ? idx.hi + 1 : idx.hi)
-            return { v: 'array', elems: obj.elems.slice(idx.lo, rawHi) }
+            return { v: 'array', elems: obj.elems.slice(idx.lo, this.rangeEnd(idx, obj.elems.length)) }
           }
           const i = Number(this.toInt(idx))
           if (i < 0 || i >= obj.elems.length)
@@ -587,8 +578,7 @@ export class VM {
         if (obj.v === 'string') {
           // range 슬라이싱: str[lo..hi] 또는 str[lo..] (open-end)
           if (idx.v === 'range') {
-            const rawHi = idx.hi === -1 ? undefined : (idx.inclusive ? idx.hi + 1 : idx.hi)
-            return { v: 'string', s: obj.s.slice(idx.lo, rawHi) }
+            return { v: 'string', s: obj.s.slice(idx.lo, this.rangeEnd(idx, obj.s.length)) }
           }
           const i = Number(this.toInt(idx))
           if (i < 0 || i >= obj.s.length)
@@ -805,11 +795,6 @@ export class VM {
   // ──────────────────────────────────────────────────────
 
   private applyBinOp(op: string, l: VVal, r: VVal): VVal {
-    if (!l || !r) {
-      // undefined/null 방어
-      if (!l) l = { v: 'none' }
-      if (!r) r = { v: 'none' }
-    }
     // in 연산자: key in map / elem in array
     if (op === 'in') {
       if (r.v === 'map')   return { v: 'bool', b: r.entries.has(toString(l)) }
@@ -828,15 +813,8 @@ export class VM {
     if (l.v === 'string' && op === '+')
       return { v: 'string', s: l.s + toString(r) }
     if (l.v === 'string') {
-      const rs = toString(r)
-      switch (op) {
-        case '==': return { v: 'bool', b: l.s === rs }
-        case '!=': return { v: 'bool', b: l.s !== rs }
-        case '<':  return { v: 'bool', b: l.s <  rs }
-        case '>':  return { v: 'bool', b: l.s >  rs }
-        case '<=': return { v: 'bool', b: l.s <= rs }
-        case '>=': return { v: 'bool', b: l.s >= rs }
-      }
+      const res = this.compareStr(l.s, toString(r), op)
+      if (res) return res
     }
 
     // int 연산
@@ -904,17 +882,30 @@ export class VM {
     }
     if (l.v === 'char') {
       const rs = r.v === 'char' ? r.c : r.v === 'string' ? r.s : toString(r)
-      switch (op) {
-        case '==': return { v: 'bool', b: l.c === rs }
-        case '!=': return { v: 'bool', b: l.c !== rs }
-        case '<':  return { v: 'bool', b: l.c <  rs }
-        case '>':  return { v: 'bool', b: l.c >  rs }
-        case '<=': return { v: 'bool', b: l.c <= rs }
-        case '>=': return { v: 'bool', b: l.c >= rs }
-      }
+      const res = this.compareStr(l.c, rs, op)
+      if (res) return res
     }
 
     throw new VError(`연산 불가: ${toString(l)} ${op} ${toString(r)}`)
+  }
+
+  // string/char 비교 연산 공통 헬퍼
+  private compareStr(l: string, r: string, op: string): VVal | null {
+    switch (op) {
+      case '==': return { v: 'bool', b: l === r }
+      case '!=': return { v: 'bool', b: l !== r }
+      case '<':  return { v: 'bool', b: l <  r }
+      case '>':  return { v: 'bool', b: l >  r }
+      case '<=': return { v: 'bool', b: l <= r }
+      case '>=': return { v: 'bool', b: l >= r }
+      default:   return null
+    }
+  }
+
+  // range 끝값 계산 공통 헬퍼
+  private rangeEnd(range: Extract<VVal, { v: 'range' }>, defaultEnd?: number): number {
+    if (range.hi === -1) return defaultEnd ?? Number.MAX_SAFE_INTEGER
+    return range.inclusive ? range.hi + 1 : range.hi
   }
 
   // ──────────────────────────────────────────────────────

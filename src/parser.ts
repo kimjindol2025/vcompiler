@@ -16,6 +16,10 @@ export interface ParseError {
 }
 
 export class Parser {
+  private static readonly BUILTIN_TYPES = new Set([
+    'int','i8','i16','i32','i64','u8','u16','u32','u64','f32','f64','string','bool','byte','rune'
+  ])
+
   private tokens: Token[]  // 사전 스캔된 all_tokens
   private tidx = 0         // 현재 토큰 인덱스
 
@@ -300,8 +304,7 @@ export class Parser {
       }
 
       // int(x), f64(n) 등 타입 캐스트
-      const builtinTypes = new Set(['int','i8','i16','i32','i64','u8','u16','u32','u64','f32','f64','string','bool','byte','rune'])
-      if (builtinTypes.has(name) && this.tok.kind === TK.LPAREN) {
+      if (Parser.BUILTIN_TYPES.has(name) && this.tok.kind === TK.LPAREN) {
         this.next()
         const expr = this.parseExpr(0)
         this.expect(TK.RPAREN)
