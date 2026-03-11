@@ -9,6 +9,7 @@
 // pipeline: IRModule → IRExecutor.runModule() → stdout
 
 import { IRModule, IRFn, IRInst, IRVal, VReg } from './ir.js'
+import { readFileSync, writeFileSync } from 'fs'
 
 // ─────────────────────────────────────────────────────
 //  제어흐름 신호 (break, continue, return)
@@ -594,6 +595,7 @@ export class IRExecutor {
       'exit', 'panic', 'assert',
       'int', 'i64', 'u8', 'f32', 'f64', 'string', 'str', 'rune', 'byte',
       'bool',
+      'ts_read_file', 'ts_write_file',
     ]
     for (const name of builtins) {
       this.global.declare(name, { v: 'builtin', name })
@@ -665,6 +667,17 @@ export class IRExecutor {
       case 'dump':
         console.error('[dump]', args.map(a => this._valToStr(a)).join(' '))
         return args[0] ?? { v: 'void' }
+      case 'ts_read_file': {
+        const path = args[0]?.v === 'string' ? args[0].s : ''
+        try { return { v: 'string', s: readFileSync(path, 'utf8') } }
+        catch { return { v: 'string', s: '' } }
+      }
+      case 'ts_write_file': {
+        const path    = args[0]?.v === 'string' ? args[0].s : ''
+        const content = args[1]?.v === 'string' ? args[1].s : ''
+        try { writeFileSync(path, content, 'utf8') } catch {}
+        return { v: 'void' }
+      }
       default:
         return { v: 'void' }
     }

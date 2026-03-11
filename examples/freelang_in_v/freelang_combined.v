@@ -265,17 +265,20 @@ enum ValKind {
 	v_array
 	v_fn
 	v_void
+	v_struct
 }
 
 struct Val {
 mut:
-	kind    ValKind
-	i_val   int        // int
-	f_val   f64        // float
-	s_val   string     // string / fn 이름
-	b_val   bool       // bool
-	elems   []Val      // array
-	fn_decl &FnDecl    // fn
+	kind      ValKind
+	i_val     int             // int
+	f_val     f64             // float
+	s_val     string          // string / fn 이름
+	b_val     bool            // bool
+	elems     []Val           // array
+	fn_decl   &FnDecl         // fn
+	fields    map[string]Val  // struct 필드
+	type_name string          // struct 타입 이름
 }
 
 fn val_int(n int) Val {
@@ -302,6 +305,33 @@ fn val_void() Val {
 	return Val{ kind: ValKind.v_void }
 }
 
+// struct 값: elems에 [key1_str, val1, key2_str, val2, ...] 형태로 저장
+fn val_struct(tname string) Val {
+	return Val{ kind: ValKind.v_struct, type_name: tname }
+}
+
+fn val_struct_get(s Val, field string) Val {
+	mut i := 0
+	for i + 1 < s.elems.len {
+		if s.elems[i].s_val == field {
+			return s.elems[i + 1]
+		}
+		i = i + 2
+	}
+	return val_null()
+}
+
+fn struct_has_field(s Val, field string) bool {
+	mut i := 0
+	for i + 1 < s.elems.len {
+		if s.elems[i].s_val == field {
+			return true
+		}
+		i = i + 2
+	}
+	return false
+}
+
 fn val_to_string(v Val) string {
 	return match v.kind {
 		.v_int    { '${v.i_val}' }
@@ -317,6 +347,15 @@ fn val_to_string(v Val) string {
 				parts << val_to_string(e)
 			}
 			'[' + parts.join(', ') + ']'
+		}
+		.v_struct {
+			mut parts := []string{}
+			mut i := 0
+			for i + 1 < v.elems.len {
+				parts << v.elems[i].s_val + ': ' + val_to_string(v.elems[i + 1])
+				i = i + 2
+			}
+			'{' + parts.join(', ') + '}'
 		}
 	}
 }
@@ -348,31 +387,39 @@ enum ExprKind {
 	e_selector
 	e_array
 	e_assign_expr
+	e_struct_lit
+}
+
+struct StructFieldInit {
+	name string
+	expr &Expr
 }
 
 struct Expr {
 mut:
-	kind    ExprKind
+	kind          ExprKind
 	// 리터럴
-	i_val   int
-	f_val   f64
-	s_val   string
-	b_val   bool
+	i_val         int
+	f_val         f64
+	s_val         string
+	b_val         bool
 	// 이항
-	op      string
-	left    &Expr
-	right   &Expr
+	op            string
+	left          &Expr
+	right         &Expr
 	// 단항
-	expr    &Expr
+	expr          &Expr
 	// 호출
-	callee  &Expr
-	args    []Expr
+	callee        &Expr
+	args          []Expr
 	// 인덱싱 / 필드
-	obj     &Expr
-	field   string
-	index   &Expr
+	obj           &Expr
+	field         string
+	index         &Expr
 	// 배열
-	elems   []Expr
+	elems         []Expr
+	// struct 리터럴
+	struct_fields []StructFieldInit
 }
 
 // ── AST 문장 ────────────────────────────────────────────
@@ -598,6 +645,22 @@ fn (mut p Parser) parse_primary() &Expr {
 		}
 		p.expect(TK.rbracket)
 		return &Expr{ kind: ExprKind.e_array, elems: elems }
+	}
+
+	// struct 리터럴 { field: expr, ... }
+	// 표현식 컨텍스트에서 { 는 항상 struct 리터럴
+	if pos_tok.kind == TK.lbrace {
+		p.next()
+		mut sf := []StructFieldInit{}
+		for p.tok.kind != TK.rbrace && p.tok.kind != TK.eof {
+			fname := p.expect_name()
+			p.expect(TK.colon)
+			fexpr := p.parse_expr(0)
+			sf << StructFieldInit{ name: fname, expr: fexpr }
+			if p.tok.kind == TK.comma { p.next() }
+		}
+		p.expect(TK.rbrace)
+		return &Expr{ kind: ExprKind.e_struct_lit, struct_fields: sf }
 	}
 
 	// 식별자
@@ -834,12 +897,15 @@ fn new_vm() &VM {
 }
 
 fn (mut vm VM) register_builtins() {
-	// println 등록 (특수 처리)
-	vm.global.declare('println', val_string('__builtin_println'), false)
-	vm.global.declare('print',   val_string('__builtin_print'),   false)
-	vm.global.declare('len',     val_string('__builtin_len'),     false)
-	vm.global.declare('str',     val_string('__builtin_str'),     false)
-	vm.global.declare('int',     val_string('__builtin_int'),     false)
+	vm.global.declare('println',     val_string('__builtin_println'),     false)
+	vm.global.declare('print',       val_string('__builtin_print'),       false)
+	vm.global.declare('len',         val_string('__builtin_len'),         false)
+	vm.global.declare('str',         val_string('__builtin_str'),         false)
+	vm.global.declare('int',         val_string('__builtin_int'),         false)
+	vm.global.declare('native_call', val_string('__builtin_native_call'), false)
+	vm.global.declare('read_file',   val_string('__builtin_read_file'),   false)
+	vm.global.declare('write_file',  val_string('__builtin_write_file'),  false)
+	vm.global.declare('type_of',     val_string('__builtin_type_of'),     false)
 }
 
 fn (mut vm VM) run(stmts []Stmt) {
@@ -1033,6 +1099,26 @@ fn (mut vm VM) eval_expr(expr Expr, mut scope Scope) Val {
 		}
 
 		.e_call {
+			// 메서드 호출 감지: obj.method(args) → callee가 e_selector
+			if expr.callee.kind == ExprKind.e_selector {
+				method := expr.callee.field
+				// arr.push(x) — 뮤터블 변이: 직접 스코프에서 수정
+				if method == 'push' && expr.callee.obj.kind == ExprKind.e_ident {
+					arr_name := expr.callee.obj.s_val
+					mut arr := scope.get(arr_name) or { return val_null() }
+					if expr.args.len > 0 {
+						new_val := vm.eval_expr(expr.args[0], mut scope)
+						arr.elems << new_val
+					}
+					scope.set(arr_name, arr)
+					return val_void()
+				}
+				// 일반 메서드: obj의 값 평가 후 call_method
+				obj := vm.eval_expr(*expr.callee.obj, mut scope)
+				call_args := expr.args.map(vm.eval_expr(it, mut scope))
+				return vm.call_method(obj, method, call_args)
+			}
+
 			// 이름 가져오기
 			callee := vm.eval_expr(*expr.callee, mut scope)
 			args := expr.args.map(vm.eval_expr(it, mut scope))
@@ -1063,13 +1149,36 @@ fn (mut vm VM) eval_expr(expr Expr, mut scope Scope) Val {
 		}
 
 		.e_selector {
-			// obj.field — 현재 미지원 (확장 가능)
+			// obj.field
+			obj := vm.eval_expr(*expr.obj, mut scope)
+			if obj.kind == ValKind.v_struct {
+				result := val_struct_get(obj, expr.field)
+				if result.kind == ValKind.v_null && !struct_has_field(obj, expr.field) {
+					println('런타임 에러: struct 필드 "${expr.field}" 없음')
+				}
+				return result
+			}
+			// 배열/문자열 .len 속성
+			if expr.field == 'len' {
+				if obj.kind == ValKind.v_array  { return val_int(obj.elems.len) }
+				if obj.kind == ValKind.v_string { return val_int(obj.s_val.len) }
+			}
 			return val_null()
 		}
 
 		.e_array {
 			elems := expr.elems.map(vm.eval_expr(it, mut scope))
 			return Val{ kind: ValKind.v_array, elems: elems }
+		}
+
+		.e_struct_lit {
+			// struct 필드를 elems에 [key_str, val, key_str, val, ...] 형태로 저장
+			mut elems := []Val{}
+			for sf in expr.struct_fields {
+				elems << val_string(sf.name)
+				elems << vm.eval_expr(*sf.expr, mut scope)
+			}
+			return Val{ kind: ValKind.v_struct, type_name: 'object', elems: elems }
 		}
 
 		else { return val_null() }
@@ -1131,6 +1240,92 @@ fn (mut vm VM) apply_binop(op string, l Val, r Val) Val {
 	return val_null()
 }
 
+fn (mut vm VM) call_method(obj Val, method string, args []Val) Val {
+	// 배열 메서드
+	if obj.kind == ValKind.v_array {
+		match method {
+			'len' { return val_int(obj.elems.len) }
+			'join' {
+				sep := if args.len > 0 { val_to_string(args[0]) } else { ',' }
+				mut parts := []string{}
+				for e in obj.elems { parts << val_to_string(e) }
+				return val_string(parts.join(sep))
+			}
+			'contains' {
+				if args.len > 0 {
+					needle := val_to_string(args[0])
+					for e in obj.elems {
+						if val_to_string(e) == needle { return val_bool(true) }
+					}
+				}
+				return val_bool(false)
+			}
+			'pop' {
+				if obj.elems.len > 0 {
+					return obj.elems[obj.elems.len - 1]
+				}
+				return val_null()
+			}
+			'first' { return if obj.elems.len > 0 { obj.elems[0] } else { val_null() } }
+			'last'  { return if obj.elems.len > 0 { obj.elems[obj.elems.len - 1] } else { val_null() } }
+			else    { return val_null() }
+		}
+	}
+	// 문자열 메서드
+	if obj.kind == ValKind.v_string {
+		match method {
+			'len'         { return val_int(obj.s_val.len) }
+			'upper'       { return val_string(obj.s_val.to_upper()) }
+			'lower'       { return val_string(obj.s_val.to_lower()) }
+			'trim'        { return val_string(obj.s_val.trim_space()) }
+			'contains' {
+				if args.len > 0 { return val_bool(obj.s_val.contains(val_to_string(args[0]))) }
+				return val_bool(false)
+			}
+			'starts_with' {
+				if args.len > 0 { return val_bool(obj.s_val.starts_with(val_to_string(args[0]))) }
+				return val_bool(false)
+			}
+			'ends_with' {
+				if args.len > 0 { return val_bool(obj.s_val.ends_with(val_to_string(args[0]))) }
+				return val_bool(false)
+			}
+			'split' {
+				sep := if args.len > 0 { val_to_string(args[0]) } else { ',' }
+				parts := obj.s_val.split(sep)
+				mut elems := []Val{}
+				for pp in parts { elems << val_string(pp) }
+				return Val{ kind: ValKind.v_array, elems: elems }
+			}
+			'replace' {
+				if args.len >= 2 {
+					from := val_to_string(args[0])
+					to   := val_to_string(args[1])
+					return val_string(obj.s_val.replace(from, to))
+				}
+				return val_string(obj.s_val)
+			}
+			else { return val_null() }
+		}
+	}
+	// struct 메서드: type_name_method 형태로 vm.fns 조회
+	if obj.kind == ValKind.v_struct {
+		full_name := obj.type_name + '_' + method
+		if full_name in vm.fns {
+			mut margs := [obj]
+			margs << args
+			return vm.call_fn(full_name, margs)
+		}
+		// struct 필드 메서드(값): 필드에서 함수 이름 찾기
+		fval := val_struct_get(obj, method)
+		if fval.kind == ValKind.v_string && fval.s_val.starts_with('__fn_') {
+			fn_name := fval.s_val[5..]
+			return vm.call_fn(fn_name, args)
+		}
+	}
+	return val_null()
+}
+
 fn (mut vm VM) call_builtin(name string, args []Val) Val {
 	match name {
 		'__builtin_println' {
@@ -1170,6 +1365,115 @@ fn (mut vm VM) call_builtin(name string, args []Val) Val {
 			}
 			return val_int(0)
 		}
+		'__builtin_type_of' {
+			if args.len > 0 {
+				return match args[0].kind {
+					.v_int    { val_string('int') }
+					.v_float  { val_string('float') }
+					.v_string { val_string('string') }
+					.v_bool   { val_string('bool') }
+					.v_null   { val_string('null') }
+					.v_array  { val_string('array') }
+					.v_struct { val_string('struct:' + args[0].type_name) }
+					else      { val_string('void') }
+				}
+			}
+			return val_string('void')
+		}
+		'__builtin_native_call' {
+			// native_call("func_name", arg1, arg2, ...)
+			if args.len >= 1 {
+				func_name := val_to_string(args[0])
+				match func_name {
+					'sqrt' {
+						n := if args.len > 1 && args[1].kind == ValKind.v_float {
+							args[1].f_val
+						} else if args.len > 1 && args[1].kind == ValKind.v_int {
+							f64(args[1].i_val)
+						} else { 0.0 }
+						if n <= 0.0 { return val_float(0.0) }
+						mut x := n / 2.0
+						mut iter := 0
+						for iter < 30 {
+							x = (x + n / x) / 2.0
+							iter = iter + 1
+						}
+						return val_float(x)
+					}
+					'abs' {
+						if args.len > 1 {
+							a := args[1]
+							if a.kind == ValKind.v_int   { return if a.i_val < 0 { val_int(-a.i_val) } else { a } }
+							if a.kind == ValKind.v_float { return if a.f_val < 0.0 { val_float(-a.f_val) } else { a } }
+						}
+						return val_int(0)
+					}
+					'max' {
+						if args.len > 2 {
+							a := args[1]; b := args[2]
+							if a.kind == ValKind.v_int && b.kind == ValKind.v_int {
+								return if a.i_val > b.i_val { a } else { b }
+							}
+							la := if a.kind == ValKind.v_float { a.f_val } else { f64(a.i_val) }
+							lb := if b.kind == ValKind.v_float { b.f_val } else { f64(b.i_val) }
+							return if la > lb { a } else { b }
+						}
+						return val_null()
+					}
+					'min' {
+						if args.len > 2 {
+							a := args[1]; b := args[2]
+							if a.kind == ValKind.v_int && b.kind == ValKind.v_int {
+								return if a.i_val < b.i_val { a } else { b }
+							}
+							la := if a.kind == ValKind.v_float { a.f_val } else { f64(a.i_val) }
+							lb := if b.kind == ValKind.v_float { b.f_val } else { f64(b.i_val) }
+							return if la < lb { a } else { b }
+						}
+						return val_null()
+					}
+					'floor' {
+						if args.len > 1 {
+							a := args[1]
+							if a.kind == ValKind.v_float { return val_int(int(a.f_val)) }
+							if a.kind == ValKind.v_int   { return a }
+						}
+						return val_int(0)
+					}
+					'pow' {
+						if args.len > 2 {
+							base := if args[1].kind == ValKind.v_float { args[1].f_val } else { f64(args[1].i_val) }
+							exp  := if args[2].kind == ValKind.v_int   { args[2].i_val } else { int(args[2].f_val) }
+							mut result := 1.0
+							mut ei := 0
+							for ei < exp { result = result * base; ei = ei + 1 }
+							return val_float(result)
+						}
+						return val_float(1.0)
+					}
+					else { return val_null() }
+				}
+			}
+			return val_null()
+		}
+		'__builtin_read_file' {
+			// TypeScript 빌트인 ts_read_file 호출
+			if args.len > 0 {
+				path := val_to_string(args[0])
+				content := ts_read_file(path)
+				return val_string(content)
+			}
+			return val_string('')
+		}
+		'__builtin_write_file' {
+			// TypeScript 빌트인 ts_write_file 호출
+			if args.len >= 2 {
+				path    := val_to_string(args[0])
+				content := val_to_string(args[1])
+				ts_write_file(path, content)
+			}
+			return val_void()
+		}
 		else { return val_null() }
 	}
 }
@@ -1199,20 +1503,68 @@ fn main() {
   result := add(10, 32)
   println(result)
 
-  println("피보나치 수열:")
+  println("--- 피보나치 수열:")
   mut i := 0
-  for i <= 10 {
+  for i <= 7 {
     println(fibonacci(i))
     i = i + 1
   }
 
   nums := [1, 2, 3, 4, 5]
-  println("배열 합계:")
+  println("--- 배열 합계:")
   mut total := 0
   for x in nums {
     total = total + x
   }
   println(total)
+
+  println("--- M1: Struct 지원")
+  p := {x: 10, y: 20}
+  println(p.x)
+  println(p.y)
+  person := {name: "Alice", age: 30}
+  println(person.name)
+  println(person.age)
+
+  println("--- M2: 배열 메서드")
+  mut arr := [1, 2, 3]
+  arr.push(4)
+  arr.push(5)
+  println(arr.len)
+  println(arr.join(","))
+  println(arr.contains(3))
+  println(arr.first())
+  println(arr.last())
+
+  println("--- M2: 문자열 메서드")
+  s := "Hello World"
+  println(s.upper())
+  println(s.lower())
+  println(s.contains("World"))
+  println(s.starts_with("Hello"))
+  println(s.replace("World", "FreeLang"))
+  parts := s.split(" ")
+  println(parts.len)
+  println(parts.join("-"))
+
+  println("--- M2: native_call 수학")
+  sq := native_call("sqrt", 16.0)
+  println(sq)
+  ab := native_call("abs", -42)
+  println(ab)
+  mx := native_call("max", 10, 20)
+  println(mx)
+  pw := native_call("pow", 2.0, 8)
+  println(pw)
+  fl := native_call("floor", 3.7)
+  println(fl)
+
+  println("--- M3: 파일 I/O")
+  write_file("/tmp/freelang_test.txt", "Hello from FreeLang!")
+  content := read_file("/tmp/freelang_test.txt")
+  println(content)
+
+  println("--- 완료")
 }
 '
 
